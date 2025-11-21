@@ -1,0 +1,51 @@
+version: '3.8'
+services:
+  mongo:
+    image: mongo:6
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  identity-ml:
+    build: ./identity-ml
+    environment:
+      - FLASK_ENV=production
+    ports:
+      - "5001:5001"
+
+  grievance-ml:
+    build: ./grievance-ml
+    environment:
+      - FLASK_ENV=production
+    ports:
+      - "5002:5002"
+
+  api-gateway:
+    build: ./api-gateway
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017
+      - DATABASE_NAME=trustguard
+      - JWT_SECRET=supersecret
+      - IDENTITY_SERVICE_URL=http://identity-ml:5001
+      - GRIEVANCE_SERVICE_URL=http://grievance-ml:5002
+      - PORT=8080
+    depends_on:
+      - mongo
+      - identity-ml
+      - grievance-ml
+    ports:
+      - "8080:8080"
+
+  next-frontend:
+    build: ./next-frontend
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8080/api
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api-gateway
+
+volumes:
+  mongo_data:
