@@ -1,12 +1,16 @@
 version: '3.8'
 services:
-  mongo:
-    image: mongo:6
+  postgres:
+    image: postgres:15
     restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trustguard
     ports:
-      - "27017:27017"
+      - "5432:5432"
     volumes:
-      - mongo_data:/data/db
+      - pg_data:/var/lib/postgresql/data
 
   identity-ml:
     build: ./identity-ml
@@ -22,17 +26,16 @@ services:
     ports:
       - "5002:5002"
 
-  api-gateway:
-    build: ./api-gateway
+  api:
+    build: .
     environment:
-      - MONGODB_URI=mongodb://mongo:27017
-      - DATABASE_NAME=trustguard
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/trustguard
       - JWT_SECRET=supersecret
       - IDENTITY_SERVICE_URL=http://identity-ml:5001
       - GRIEVANCE_SERVICE_URL=http://grievance-ml:5002
       - PORT=8080
     depends_on:
-      - mongo
+      - postgres
       - identity-ml
       - grievance-ml
     ports:
@@ -45,7 +48,7 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - api-gateway
+      - api
 
 volumes:
-  mongo_data:
+  pg_data:

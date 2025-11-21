@@ -11,11 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
-from bson import ObjectId
 import bcrypt
 import jwt
 
-from database import db, create_document, get_documents
+from database import fetchone, fetchall, execute
 
 load_dotenv()
 
@@ -69,10 +68,7 @@ def auth_dependency(credentials: HTTPAuthorizationCredentials = Depends(security
 def api_success(data: Any, status_code: int = 200):
     return {"success": True, "data": data, "error": None, "statusCode": status_code}
 
-def api_error(message: str, status_code: int = 400):
-    return {"success": False, "data": None, "error": message, "statusCode": status_code}
-
-# ----- Models (Pydantic DTOs) -----
+# ----- DTOs -----
 class RegisterDto(BaseModel):
     email: EmailStr
     password: str
@@ -81,9 +77,6 @@ class RegisterDto(BaseModel):
 class LoginDto(BaseModel):
     email: EmailStr
     password: str
-
-class VerifyAppDto(BaseModel):
-    package_name: Optional[str] = None
 
 class FileGrievanceDto(BaseModel):
     text: str
@@ -99,9 +92,8 @@ def root():
 
 @app.get("/health")
 def health():
-    # Simple DB check
     try:
-        _ = db.list_collection_names()
+        _ = fetchone("SELECT 1 AS ok")
         db_ok = True
     except Exception:
         db_ok = False
@@ -111,54 +103,47 @@ def health():
 @app.post("/api/auth/register")
 def register(dto: RegisterDto):
     start = time.time()
-    users = db["user"]
-    existing = users.find_one({"email": dto.email.lower()})
+    existing = fetchone("SELECT id FROM users WHERE lower(email)=lower(%s)", [dto.email])
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
     salt = bcrypt.gensalt(rounds=10)
-    hashed = bcrypt.hashpw(dto.password.encode("utf-8"), salt)
-    user_doc = {
-        "email": dto.email.lower(),
-        "password": hashed.decode("utf-8"),
-        "name": dto.name,
-        "createdAt": datetime.now(timezone.utc)
-    }
-    result = users.insert_one(user_doc)
-    user_id = str(result.inserted_id)
-    token = create_token({"sub": user_id, "email": dto.email.lower()})
+    hashed = bcrypt.hashpw(dto.password.encode("utf-8"), salt).decode("utf-8")
+    user = fetchone(
+        "INSERT INTO users(email, password, name) VALUES(%s,%s,%s) RETURNING id, email, name",
+        [dto.email.lower(), hashed, dto.name],
+    )
+    token = create_token({"sub": str(user["id"]), "email": user["email"]})
     latency_ms = int((time.time() - start) * 1000)
     logger.info("register success %s", dto.email)
     return api_success({
         "token": token,
-        "user": {"id": user_id, "email": dto.email.lower(), "name": dto.name},
-        "latency_ms": latency_ms
+        "user": {"id": user["id"], "email": user["email"], "name": user["name"]},
+        "latency_ms": latency_ms,
     })
 
 @app.post("/api/auth/login")
 def login(dto: LoginDto):
     start = time.time()
-    users = db["user"]
-    user = users.find_one({"email": dto.email.lower()})
+    user = fetchone("SELECT id, email, password, name FROM users WHERE lower(email)=lower(%s)", [dto.email])
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if not bcrypt.checkpw(dto.password.encode("utf-8"), user["password"].encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid password")
-    token = create_token({"sub": str(user["_id"]), "email": user["email"]})
+    token = create_token({"sub": str(user["id"]), "email": user["email"]})
     latency_ms = int((time.time() - start) * 1000)
     logger.info("login success %s", dto.email)
     return api_success({
         "token": token,
-        "user": {"id": str(user["_id"]), "email": user["email"], "name": user.get("name")},
-        "latency_ms": latency_ms
+        "user": {"id": user["id"], "email": user["email"], "name": user.get("name")},
+        "latency_ms": latency_ms,
     })
 
 @app.get("/api/auth/me")
 def me(claims: Dict[str, Any] = Depends(auth_dependency)):
-    users = db["user"]
-    user = users.find_one({"_id": ObjectId(claims["sub"])})
+    user = fetchone("SELECT id, email, name FROM users WHERE id=%s", [int(claims["sub"])])
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return api_success({"id": str(user["_id"]), "email": user["email"], "name": user.get("name")})
+    return api_success({"id": user["id"], "email": user["email"], "name": user["name"]})
 
 # ----- Identity Verification -----
 @app.post("/api/identity/verify")
@@ -178,16 +163,15 @@ async def identity_verify(video: UploadFile = File(...), claims: Dict[str, Any] 
         latency_ms = int((time.time() - start) * 1000)
         payload["latency_ms"] = payload.get("latency_ms", latency_ms)
         # Persist
-        doc = {
-            "user_id": ObjectId(claims["sub"]),
-            "deepfake_score": payload.get("deepfake_score", 0.0),
-            "liveness_status": payload.get("liveness_status", "PASS"),
-            "overall_result": payload.get("overall_result", "VERIFIED"),
-            "latency_ms": payload.get("latency_ms", latency_ms),
-            "createdAt": datetime.now(timezone.utc)
-        }
-        res = db["identitycheck"].insert_one(doc)
-        payload["id"] = str(res.inserted_id)
+        row = fetchone(
+            """
+            INSERT INTO identity_checks(user_id, deepfake_score, liveness_status, overall_result, latency_ms)
+            VALUES(%s,%s,%s,%s,%s)
+            RETURNING id
+            """,
+            [int(claims["sub"]), float(payload.get("deepfake_score", 0.0)), payload.get("liveness_status", "PASS"), payload.get("overall_result", "VERIFIED"), int(payload.get("latency_ms", latency_ms))],
+        )
+        payload["id"] = row["id"]
         logger.info("identity verification completed user=%s result=%s", claims.get("sub"), payload.get("overall_result"))
         return api_success(payload)
     except HTTPException:
@@ -197,18 +181,21 @@ async def identity_verify(video: UploadFile = File(...), claims: Dict[str, Any] 
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/identity/result/{id}")
-def identity_result(id: str, claims: Dict[str, Any] = Depends(auth_dependency)):
+def identity_result(id: int, claims: Dict[str, Any] = Depends(auth_dependency)):
     try:
-        doc = db["identitycheck"].find_one({"_id": ObjectId(id), "user_id": ObjectId(claims["sub"])})
+        doc = fetchone(
+            "SELECT id, deepfake_score, liveness_status, overall_result, latency_ms, created_at FROM identity_checks WHERE id=%s AND user_id=%s",
+            [id, int(claims["sub"])],
+        )
         if not doc:
             raise HTTPException(status_code=404, detail="Result not found")
         data = {
-            "id": str(doc["_id"]),
-            "deepfake_score": doc.get("deepfake_score"),
-            "liveness_status": doc.get("liveness_status"),
-            "overall_result": doc.get("overall_result"),
-            "latency_ms": doc.get("latency_ms"),
-            "createdAt": doc.get("createdAt")
+            "id": doc["id"],
+            "deepfake_score": doc["deepfake_score"],
+            "liveness_status": doc["liveness_status"],
+            "overall_result": doc["overall_result"],
+            "latency_ms": doc["latency_ms"],
+            "createdAt": doc["created_at"],
         }
         return api_success(data)
     except HTTPException:
@@ -219,7 +206,11 @@ def identity_result(id: str, claims: Dict[str, Any] = Depends(auth_dependency)):
 
 # ----- App Authenticator -----
 @app.post("/api/app/verify")
-async def app_verify(package_name: Optional[str] = Form(None), apk: Optional[UploadFile] = File(None), claims: Dict[str, Any] = Depends(auth_dependency)):
+async def app_verify(
+    package_name: Optional[str] = Form(None),
+    apk: Optional[UploadFile] = File(None),
+    claims: Dict[str, Any] = Depends(auth_dependency),
+):
     start = time.time()
     status_label = "UNKNOWN"
     publisher = None
@@ -231,21 +222,23 @@ async def app_verify(package_name: Optional[str] = Form(None), apk: Optional[Upl
         if apk is not None:
             content = await apk.read()
             sha256_hash = hashlib.sha256(content).hexdigest()
-        coll_off = db["officialapp"]
-        coll_susp = db["suspiciousapp"]
-        query = {}
-        if package_name:
-            query["package_name"] = package_name
-        if sha256_hash:
-            query["sha256_hash"] = sha256_hash
-        official = coll_off.find_one(query)
+        official = None
+        if package_name or sha256_hash:
+            if package_name and sha256_hash:
+                official = fetchone("SELECT * FROM official_apps WHERE package_name=%s OR sha256_hash=%s LIMIT 1", [package_name, sha256_hash])
+            elif package_name:
+                official = fetchone("SELECT * FROM official_apps WHERE package_name=%s LIMIT 1", [package_name])
+            elif sha256_hash:
+                official = fetchone("SELECT * FROM official_apps WHERE sha256_hash=%s LIMIT 1", [sha256_hash])
         if official:
             status_label = "OFFICIAL"
             publisher = official.get("publisher")
             google_play_link = official.get("google_play_link")
             confidence = 0.98
         else:
-            suspicious = coll_susp.find_one({k: v for k, v in query.items() if k in ["package_name"]})
+            suspicious = None
+            if package_name:
+                suspicious = fetchone("SELECT * FROM suspicious_apps WHERE package_name=%s LIMIT 1", [package_name])
             if suspicious:
                 status_label = "SUSPICIOUS"
                 publisher = suspicious.get("publisher")
@@ -257,7 +250,7 @@ async def app_verify(package_name: Optional[str] = Form(None), apk: Optional[Upl
             "publisher": publisher,
             "google_play_link": google_play_link,
             "confidence": confidence,
-            "latency_ms": latency_ms
+            "latency_ms": latency_ms,
         }
         logger.info("app verify package=%s status=%s", package_name, status_label)
         return api_success(data)
@@ -267,24 +260,25 @@ async def app_verify(package_name: Optional[str] = Form(None), apk: Optional[Upl
 
 @app.get("/api/app/registry")
 def app_registry(claims: Dict[str, Any] = Depends(auth_dependency)):
-    items = list(db["officialapp"].find().limit(100))
-    for it in items:
-        it["id"] = str(it.pop("_id"))
+    items = fetchall("SELECT id, package_name, sha256_hash, publisher, google_play_link, last_verified FROM official_apps ORDER BY id DESC LIMIT 100")
     return api_success(items)
 
 @app.get("/api/app/suspicious")
 def app_suspicious(claims: Dict[str, Any] = Depends(auth_dependency)):
-    items = list(db["suspiciousapp"].find().limit(100))
-    for it in items:
-        it["id"] = str(it.pop("_id"))
+    items = fetchall("SELECT id, package_name, publisher, google_play_link, confidence FROM suspicious_apps ORDER BY id DESC LIMIT 100")
     return api_success(items)
 
 @app.post("/api/app/registry")
 def app_add_official(body: Dict[str, Any], claims: Dict[str, Any] = Depends(auth_dependency)):
-    # Simple admin check: first registered user can be admin; for MVP, allow all authenticated to add
-    body["last_verified"] = datetime.now(timezone.utc)
-    res = db["officialapp"].insert_one(body)
-    return api_success({"id": str(res.inserted_id)})
+    row = fetchone(
+        """
+        INSERT INTO official_apps(package_name, sha256_hash, publisher, google_play_link)
+        VALUES(%s,%s,%s,%s)
+        RETURNING id
+        """,
+        [body.get("package_name"), body.get("sha256_hash"), body.get("publisher"), body.get("google_play_link")],
+    )
+    return api_success({"id": row["id"]})
 
 # ----- Grievance -----
 CATEGORIES = [
@@ -313,36 +307,33 @@ def file_grievance(dto: FileGrievanceDto, claims: Dict[str, Any] = Depends(auth_
             category = "other"
     urgency = "HIGH" if (category in ["card_fraud", "unauthorized_debit"] or ("fraud" in dto.text.lower() or "debit" in dto.text.lower())) else "MEDIUM"
     complaint_id = f"CASE#{int(time.time()*1000)}"
-    doc = {
-        "complaint_id": complaint_id,
-        "user_id": ObjectId(claims["sub"]),
-        "text": dto.text,
-        "category": category if category in CATEGORIES else "other",
-        "urgency": urgency,
-        "status": "RECEIVED",
-        "createdAt": datetime.now(timezone.utc),
-        "updatedAt": datetime.now(timezone.utc)
-    }
-    db["grievance"].insert_one(doc)
+    row = fetchone(
+        """
+        INSERT INTO grievances(complaint_id, user_id, text, category, urgency, status, created_at, updated_at)
+        VALUES(%s,%s,%s,%s,%s,%s,NOW(),NOW())
+        RETURNING complaint_id, category, urgency, status, created_at
+        """,
+        [complaint_id, int(claims["sub"]), dto.text, category if category in CATEGORIES else "other", urgency, "RECEIVED"],
+    )
     latency_ms = int((time.time() - start) * 1000)
     return api_success({
-        "complaint_id": complaint_id,
-        "category": doc["category"],
-        "urgency": urgency,
-        "status": doc["status"],
-        "createdAt": doc["createdAt"],
-        "latency_ms": latency_ms
+        "complaint_id": row["complaint_id"],
+        "category": row["category"],
+        "urgency": row["urgency"],
+        "status": row["status"],
+        "createdAt": row["created_at"],
+        "latency_ms": latency_ms,
     })
 
 @app.get("/api/grievance/status/{complaint_id}")
 def grievance_status(complaint_id: str, claims: Dict[str, Any] = Depends(auth_dependency)):
-    doc = db["grievance"].find_one({"complaint_id": complaint_id, "user_id": ObjectId(claims["sub"])})
+    doc = fetchone("SELECT complaint_id, category, urgency, status, created_at, updated_at FROM grievances WHERE complaint_id=%s AND user_id=%s", [complaint_id, int(claims["sub"])])
     if not doc:
         raise HTTPException(status_code=404, detail="Complaint not found")
-    last_update = doc.get("updatedAt", doc.get("createdAt", datetime.now(timezone.utc)))
+    last_update = doc.get("updated_at") or doc.get("created_at") or datetime.now(timezone.utc)
     next_update = last_update + timedelta(hours=24)
     timeline = [
-        {"event": "created", "at": doc.get("createdAt")},
+        {"event": "created", "at": doc.get("created_at")},
     ]
     if doc.get("status") == "IN_PROGRESS":
         timeline.append({"event": "in_progress", "at": last_update})
@@ -354,7 +345,7 @@ def grievance_status(complaint_id: str, claims: Dict[str, Any] = Depends(auth_de
         "urgency": doc.get("urgency"),
         "status": doc.get("status"),
         "timeline": timeline,
-        "next_update_expected": next_update.isoformat()
+        "next_update_expected": next_update.isoformat(),
     })
 
 @app.post("/api/grievance/categorize")
@@ -371,26 +362,18 @@ def grievance_categorize(dto: CategorizeDto, claims: Dict[str, Any] = Depends(au
 
 @app.get("/api/grievance/analytics")
 def grievance_analytics(claims: Dict[str, Any] = Depends(auth_dependency)):
-    total = db["grievance"].count_documents({})
-    # by category
-    pipeline = [
-        {"$group": {"_id": "$category", "count": {"$sum": 1}}}
-    ]
-    cat_counts = {i["_id"]: i["count"] for i in db["grievance"].aggregate(pipeline)}
-    # avg resolution time (placeholder using created->updated)
-    # For MVP, compute avg(updatedAt - createdAt)
-    times = []
-    for g in db["grievance"].find({}, {"createdAt": 1, "updatedAt": 1}):
-        if g.get("createdAt") and g.get("updatedAt"):
-            diff = (g["updatedAt"] - g["createdAt"]).total_seconds() / 3600.0
-            times.append(diff)
-    avg_resolution = sum(times) / len(times) if times else 0.0
-    high_pending = db["grievance"].count_documents({"urgency": "HIGH", "status": {"$ne": "RESOLVED"}})
+    total = fetchone("SELECT COUNT(*) AS c FROM grievances")
+    rows = fetchall("SELECT category, COUNT(*) AS c FROM grievances GROUP BY category")
+    cat_counts = {r["category"]: r["c"] for r in rows}
+    times = fetchall("SELECT EXTRACT(EPOCH FROM (updated_at - created_at))/3600.0 AS hrs FROM grievances WHERE updated_at IS NOT NULL AND created_at IS NOT NULL")
+    vals = [t["hrs"] for t in times]
+    avg_resolution = sum(vals)/len(vals) if vals else 0.0
+    high_pending = fetchone("SELECT COUNT(*) AS c FROM grievances WHERE urgency='HIGH' AND status <> 'RESOLVED'")
     return api_success({
-        "total_complaints": total,
+        "total_complaints": total["c"] if total else 0,
         "by_category": cat_counts,
         "avg_resolution_time_hours": round(avg_resolution, 2),
-        "high_priority_pending": high_pending
+        "high_priority_pending": high_pending["c"] if high_pending else 0,
     })
 
 # Existing test endpoint
@@ -400,27 +383,21 @@ def test_database():
         "backend": "✅ Running",
         "database": "❌ Not Available",
         "database_url": None,
-        "database_name": None,
         "connection_status": "Not Connected",
-        "collections": []
+        "tables": []
     }
     try:
-        if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = getattr(db, 'name', '✅ Connected')
-            response["connection_status"] = "Connected"
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
+        _ = fetchone("SELECT 1 AS ok")
+        response["database"] = "✅ Connected & Working"
+        response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
+        response["connection_status"] = "Connected"
+        try:
+            rows = fetchall("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
+            response["tables"] = [r["table_name"] for r in rows][:20]
+        except Exception as e:
+            response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    import os as _os
-    response["database_url"] = "✅ Set" if _os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if _os.getenv("DATABASE_NAME") else "❌ Not Set"
     return response
 
 if __name__ == "__main__":
